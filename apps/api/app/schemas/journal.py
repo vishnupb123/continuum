@@ -25,3 +25,12 @@ class JournalRead(BaseModel):
 class JournalAccepted(BaseModel):
     id: UUID
     status: str
+    
+class JournalListResponse(BaseModel):
+    items: list[JournalRead]
+    total: int
+    limit: int
+    offset: int
+    
+class JournalUpdate(BaseModel):
+    text: str = Field(min_length=1, max_length=10000)
