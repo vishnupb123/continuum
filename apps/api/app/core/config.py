@@ -8,5 +8,14 @@ class Settings(BaseSettings):
     JWT_SECRET_KEY: str = "dev-only-change-me"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    audio_storage_backend: str = "local"
+    audio_storage_path: str = "/data/audio"
+    transcription_provider: str = "mock"
+    openai_api_key: str | None = None
+    openai_transcription_model: str = "gpt-transcribe"
+    local_whisper_model: str = "small.en"
+    local_whisper_device: str = "cpu"
+    local_whisper_compute_type: str = "int8"
+    local_whisper_download_root: str = "/models"
 
 settings = Settings()

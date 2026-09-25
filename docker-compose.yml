@@ -10,7 +10,11 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-continuum} -d ${POSTGRES_DB:-continuum}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-continuum} -d ${POSTGRES_DB:-continuum}"
+        ]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -31,6 +35,14 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://continuum:continuum@postgres:5432/continuum}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AUDIO_STORAGE_BACKEND: ${AUDIO_STORAGE_BACKEND:-local}
+      AUDIO_STORAGE_PATH: ${AUDIO_STORAGE_PATH:-/data/audio}
+
+      # Transcription
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TRANSCRIPTION_MODEL: ${OPENAI_TRANSCRIPTION_MODEL:-gpt-transcribe}
+
     ports:
       - "8000:8000"
     depends_on:
@@ -38,9 +50,14 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-    command: sh -c "alembic -c /app/alembic.ini upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+    command: >
+      sh -c "
+      alembic -c /app/alembic.ini upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
     volumes:
       - ./apps/api:/app
+      - audio_data:/data/audio
 
   worker:
     build:
@@ -48,6 +65,20 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://continuum:continuum@postgres:5432/continuum}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      AUDIO_STORAGE_BACKEND: ${AUDIO_STORAGE_BACKEND:-local}
+      AUDIO_STORAGE_PATH: ${AUDIO_STORAGE_PATH:-/data/audio}
+      
+      # Transcription
+      TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-mock}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_TRANSCRIPTION_MODEL: ${OPENAI_TRANSCRIPTION_MODEL:-gpt-transcribe}
+
+      LOCAL_WHISPER_MODEL: ${LOCAL_WHISPER_MODEL:-small.en}
+      LOCAL_WHISPER_DEVICE: ${LOCAL_WHISPER_DEVICE:-cpu}
+      LOCAL_WHISPER_COMPUTE_TYPE: ${LOCAL_WHISPER_COMPUTE_TYPE:-int8}
+      LOCAL_WHISPER_DOWNLOAD_ROOT: ${LOCAL_WHISPER_DOWNLOAD_ROOT:-/models}
+
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -55,9 +86,17 @@ services:
         condition: service_healthy
       api:
         condition: service_started
-    command: celery -A app.tasks.celery_app.celery_app worker --loglevel=info
+    command:
+        - celery
+        - -A
+        - app.tasks.celery_app.celery_app
+        - worker
+        - --loglevel=info
+        - --concurrency=1
     volumes:
       - ./apps/api:/app
+      - audio_data:/data/audio
+      - whisper_models:/models
 
   web:
     build:
@@ -75,3 +114,5 @@ services:
 
 volumes:
   postgres_data:
+  audio_data:
+  whisper_models:

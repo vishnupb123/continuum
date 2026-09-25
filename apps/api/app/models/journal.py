@@ -28,10 +28,10 @@ class JournalEntry(Base):
         nullable=False,
     )
 
-    raw_text: Mapped[str] = mapped_column(
-        Text,
-        nullable=False,
-    )
+    raw_text: Mapped[str | None] = mapped_column(
+    Text,
+    nullable=True,
+   )
 
     status: Mapped[str] = mapped_column(
         String(40),
@@ -70,3 +70,11 @@ class JournalEntry(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    
+    # M2: optional private audio associated with a voice journal
+    audio = relationship(
+    "JournalAudio",
+    back_populates="journal",
+    uselist=False,
+    cascade="all, delete-orphan",
+    )   
