@@ -2,6 +2,7 @@ import hashlib
 
 import pytest
 from sqlalchemy.exc import IntegrityError
+import numpy as np
 
 from app.models.audio_feature import AudioFeature
 from app.models.journal import JournalEntry
@@ -109,6 +110,96 @@ def test_text_feature_set_persists(db_session):
     )
 
     assert stored.audio_feature is None
+    
+def test_text_embedding_persists(db_session):
+    user = make_user(
+        db_session,
+        email="embedding-persistence@example.com",
+    )
+
+    journal = make_journal(
+        db_session,
+        user,
+        text="Continuum should persist semantic embeddings.",
+    )
+
+    embedding = [
+        float(index) / 768.0
+        for index in range(768)
+    ]
+
+    feature_set = JournalFeatureSet(
+        journal_id=journal.id,
+        pipeline_version="m3-v1",
+        source_hash=source_hash(
+            journal.raw_text
+        ),
+        status="COMPLETED",
+    )
+
+    feature_set.text_feature = TextFeature(
+        source_type="RAW_TEXT",
+        preprocessing_version="text-preprocess-v1",
+        encoder_name="sentence-transformers/all-mpnet-base-v2",
+        encoder_version="text-encoder-v1",
+        encoder_revision=(
+          "e8c3b32edf5434bc2275fc9bab85f82640a19130"
+        ),
+        embedding_dimension=768,
+        embedding=embedding,
+        word_count=5,
+        character_count=len(
+            journal.raw_text
+        ),
+        quality_status="GOOD",
+        feature_metadata={
+            "test": "embedding-persistence",
+        },
+    )
+
+    db_session.add(feature_set)
+    db_session.commit()
+
+    text_feature_id = feature_set.text_feature.id
+
+    db_session.expire_all()
+
+    stored = db_session.get(
+        TextFeature,
+        text_feature_id,
+    )
+
+    assert stored is not None
+    assert stored.embedding is not None
+
+    assert stored.embedding_dimension == 768
+    assert len(stored.embedding) == 768
+
+    assert (
+        stored.encoder_name
+        == "sentence-transformers/all-mpnet-base-v2"
+    )
+    assert (
+        stored.encoder_version
+        == "text-encoder-v1"
+    )
+    assert (
+        stored.encoder_revision
+        == "e8c3b32edf5434bc2275fc9bab85f82640a19130"
+    )
+
+    np.testing.assert_allclose(
+        np.asarray(
+            stored.embedding,
+            dtype=np.float32,
+        ),
+        np.asarray(
+            embedding,
+            dtype=np.float32,
+        ),
+        rtol=1e-6,
+        atol=1e-6,
+    )
 
 
 def test_voice_feature_set_supports_both_modalities(
@@ -397,4 +488,118 @@ def test_deleting_journal_cascades_feature_data(
             audio_feature_id,
         )
         is None
+    )
+    
+def test_text_embeddings_support_cosine_similarity(
+    db_session,
+):
+    user = make_user(
+        db_session,
+        email="cosine-similarity@example.com",
+    )
+
+    journal_a = make_journal(
+        db_session,
+        user,
+        text="Vector A",
+    )
+
+    journal_b = make_journal(
+        db_session,
+        user,
+        text="Vector B",
+    )
+
+    journal_c = make_journal(
+        db_session,
+        user,
+        text="Vector C",
+    )
+
+    vector_a = [0.0] * 768
+    vector_b = [0.0] * 768
+    vector_c = [0.0] * 768
+
+    # A and B point in nearly the same direction.
+    vector_a[0] = 1.0
+
+    vector_b[0] = 0.9
+    vector_b[1] = 0.1
+
+    # C points in a completely different direction.
+    vector_c[1] = 1.0
+
+    def add_feature_set(journal, embedding):
+        feature_set = JournalFeatureSet(
+            journal_id=journal.id,
+            pipeline_version="m3-v1",
+            source_hash=source_hash(
+                journal.raw_text
+            ),
+            status="COMPLETED",
+        )
+
+        feature_set.text_feature = TextFeature(
+            source_type="RAW_TEXT",
+            preprocessing_version="text-preprocess-v1",
+            encoder_name=(
+                "sentence-transformers/"
+                "all-mpnet-base-v2"
+            ),
+            encoder_version="text-encoder-v1",
+            encoder_revision=(
+                "e8c3b32edf5434bc2275fc9bab85f82640a19130"
+            ),
+            embedding_dimension=768,
+            embedding=embedding,
+            word_count=2,
+            character_count=len(
+                journal.raw_text
+            ),
+            quality_status="GOOD",
+            feature_metadata={},
+        )
+
+        db_session.add(feature_set)
+
+    add_feature_set(journal_a, vector_a)
+    add_feature_set(journal_b, vector_b)
+    add_feature_set(journal_c, vector_c)
+
+    db_session.commit()
+
+    results = (
+        db_session.query(TextFeature)
+        .order_by(
+            TextFeature.embedding.cosine_distance(
+                vector_a
+            )
+        )
+        .all()
+    )
+
+    assert len(results) == 3
+
+    # Exact/self match should be closest.
+    assert (
+        results[0]
+        .feature_set
+        .journal_id
+        == journal_a.id
+    )
+
+    # Similar vector should come next.
+    assert (
+        results[1]
+        .feature_set
+        .journal_id
+        == journal_b.id
+    )
+
+    # Orthogonal vector should be least similar.
+    assert (
+        results[2]
+        .feature_set
+        .journal_id
+        == journal_c.id
     )

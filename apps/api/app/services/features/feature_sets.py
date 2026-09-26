@@ -138,3 +138,34 @@ def mark_feature_set_failed(
     feature_set.status = FEATURE_STATUS_FAILED
     feature_set.error_message = error_message
     feature_set.completed_at = None
+    
+def complete_feature_set_if_ready(
+    feature_set: JournalFeatureSet,
+    *,
+    entry_type: str,
+) -> bool:
+    if entry_type == "TEXT":
+        if feature_set.text_feature is None:
+            return False
+
+        mark_feature_set_completed(
+            feature_set
+        )
+        return True
+
+    if entry_type == "VOICE":
+        if feature_set.text_feature is None:
+            return False
+
+        if feature_set.audio_feature is None:
+            return False
+
+        mark_feature_set_completed(
+            feature_set
+        )
+        return True
+
+    raise ValueError(
+        f"Unsupported journal entry type: "
+        f"{entry_type}"
+    )
