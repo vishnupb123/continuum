@@ -78,3 +78,9 @@ class JournalEntry(Base):
     uselist=False,
     cascade="all, delete-orphan",
     )   
+    
+    feature_sets = relationship(
+    "JournalFeatureSet",
+    back_populates="journal",
+    cascade="all, delete-orphan",
+)
