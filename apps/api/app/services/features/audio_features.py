@@ -9,6 +9,12 @@ from app.services.features.acoustic_features import (
     AcousticFeatureResult,
     extract_acoustic_features,
 )
+from app.services.features.audio_encoder import (
+    AudioEncodingResult,
+)
+from app.services.features.audio_encoder_factory import (
+    get_audio_encoder,
+)
 from app.services.features.audio_pipeline import (
     AudioPipelineResult,
     process_audio,
@@ -28,6 +34,7 @@ class AudioFeatureExtractionResult:
     audio_feature: AudioFeature
     pipeline_result: AudioPipelineResult
     acoustic_features: AcousticFeatureResult
+    audio_encoding: AudioEncodingResult
 
 
 def extract_audio_features(
@@ -37,8 +44,8 @@ def extract_audio_features(
     feature_set: JournalFeatureSet,
 ) -> AudioFeatureExtractionResult:
     """
-    Extract and persist deterministic audio features for a VOICE
-    journal.
+    Extract and persist deterministic and learned audio
+    representations for a VOICE journal.
 
     Pipeline:
 
@@ -50,16 +57,19 @@ def extract_audio_features(
                 +--> engineering quality measurements
                 |
                 v
-        canonical 16 kHz waveform
+        canonical mono 16 kHz float32 waveform
                 |
-                v
-        M3.5 deterministic acoustic features
+                +--> M3.5 deterministic acoustic features
+                |
+                +--> M3.6 learned WavLM representation
                 |
                 v
         AudioFeature persistence
 
-    Learned neural audio embeddings are intentionally excluded.
-    They belong to M3.6.
+    The learned representation is a frozen journal-level embedding.
+
+    No psychological, emotional, diagnostic, or clinical conclusions
+    are produced at this layer.
     """
 
     if feature_set.journal_id != journal.id:
@@ -92,9 +102,19 @@ def extract_audio_features(
         feature_set
     )
 
+    # ---------------------------------------------------------
+    # M3.4
+    # Encoded private audio -> canonical waveform + quality.
+    # ---------------------------------------------------------
+
     pipeline_result = process_audio(
         audio_bytes
     )
+
+    # ---------------------------------------------------------
+    # M3.5
+    # Deterministic, interpretable acoustic representation.
+    # ---------------------------------------------------------
 
     acoustic_features = (
         extract_acoustic_features(
@@ -105,21 +125,54 @@ def extract_audio_features(
         )
     )
 
+    # ---------------------------------------------------------
+    # M3.6
+    # Frozen learned audio representation.
+    #
+    # Both M3.5 and M3.6 consume the exact same canonical
+    # waveform produced by M3.4.
+    # ---------------------------------------------------------
+
+    audio_encoder = get_audio_encoder()
+
+    audio_encoding = audio_encoder.encode(
+        pipeline_result.waveform,
+        sample_rate_hz=(
+            pipeline_result.sample_rate_hz
+        ),
+    )
+
+    # ---------------------------------------------------------
+    # Persistence
+    # ---------------------------------------------------------
+
     audio_feature = AudioFeature(
         preprocessing_version=(
             pipeline_result.preprocessing_version
         ),
 
-        # Reserved for M3.6 learned embeddings.
-        encoder_name=None,
-        encoder_version=None,
-        embedding_dimension=None,
+        encoder_name=(
+            audio_encoding.encoder_name
+        ),
+        encoder_version=(
+            audio_encoding.encoder_version
+        ),
+        encoder_revision=(
+            audio_encoding.encoder_revision
+        ),
+        embedding_dimension=(
+            audio_encoding.embedding_dimension
+        ),
+        embedding=(
+            audio_encoding.embedding.tolist()
+        ),
 
         duration_seconds=(
             pipeline_result.duration_seconds
         ),
 
-        # Remains NULL until we implement an actual VAD.
+        # Remains NULL until an actual VAD is introduced.
+        #
         # M3.5 signal_activity_ratio is explicitly NOT a
         # speech ratio.
         speech_ratio=None,
@@ -226,6 +279,34 @@ def extract_audio_features(
                     acoustic_features.mfcc_std
                 ),
             },
+
+            # M3.6 learned representation metadata.
+            #
+            # The embedding itself belongs in the pgvector column,
+            # not inside JSON.
+            "audio_embedding": {
+                "encoder_name": (
+                    audio_encoding.encoder_name
+                ),
+                "encoder_version": (
+                    audio_encoding.encoder_version
+                ),
+                "encoder_revision": (
+                    audio_encoding.encoder_revision
+                ),
+                "embedding_dimension": (
+                    audio_encoding.embedding_dimension
+                ),
+                "sample_rate_hz": (
+                    audio_encoding.sample_rate_hz
+                ),
+                "pooling_strategy": (
+                    audio_encoding.pooling_strategy
+                ),
+                "normalization": (
+                    audio_encoding.normalization
+                ),
+            },
         },
     )
 
@@ -247,4 +328,5 @@ def extract_audio_features(
         audio_feature=audio_feature,
         pipeline_result=pipeline_result,
         acoustic_features=acoustic_features,
+        audio_encoding=audio_encoding,
     )

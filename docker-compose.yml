@@ -35,6 +35,8 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://continuum:continuum@postgres:5432/continuum}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+
+      # Audio storage
       AUDIO_STORAGE_BACKEND: ${AUDIO_STORAGE_BACKEND:-local}
       AUDIO_STORAGE_PATH: ${AUDIO_STORAGE_PATH:-/data/audio}
 
@@ -43,29 +45,40 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_TRANSCRIPTION_MODEL: ${OPENAI_TRANSCRIPTION_MODEL:-gpt-transcribe}
 
-            # Text encoder
+      # Text encoder
       TEXT_ENCODER_PROVIDER: ${TEXT_ENCODER_PROVIDER:-mpnet}
       TEXT_ENCODER_MODEL: ${TEXT_ENCODER_MODEL:-sentence-transformers/all-mpnet-base-v2}
       TEXT_ENCODER_REVISION: ${TEXT_ENCODER_REVISION:-}
       TEXT_ENCODER_DEVICE: ${TEXT_ENCODER_DEVICE:-cpu}
       TEXT_ENCODER_CACHE_PATH: ${TEXT_ENCODER_CACHE_PATH:-/text-models}
 
+      # Audio encoder
+      AUDIO_ENCODER_PROVIDER: ${AUDIO_ENCODER_PROVIDER:-wavlm}
+      AUDIO_ENCODER_MODEL: ${AUDIO_ENCODER_MODEL:-microsoft/wavlm-base-plus}
+      AUDIO_ENCODER_REVISION: ${AUDIO_ENCODER_REVISION:-4c66d4806a428f2e922ccfa1a962776e232d487b}
+      AUDIO_ENCODER_DEVICE: ${AUDIO_ENCODER_DEVICE:-cpu}
+      AUDIO_ENCODER_CACHE_PATH: ${AUDIO_ENCODER_CACHE_PATH:-/audio-models}
+
     ports:
       - "8000:8000"
+
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
+
     command: >
       sh -c "
       alembic -c /app/alembic.ini upgrade head &&
       uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
       "
+
     volumes:
       - ./apps/api:/app
       - audio_data:/data/audio
       - text_models:/text-models
+      - audio_models:/audio-models
 
   worker:
     build:
@@ -73,27 +86,35 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://continuum:continuum@postgres:5432/continuum}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+
+      # Audio storage
       AUDIO_STORAGE_BACKEND: ${AUDIO_STORAGE_BACKEND:-local}
       AUDIO_STORAGE_PATH: ${AUDIO_STORAGE_PATH:-/data/audio}
-      
+
       # Transcription
       TRANSCRIPTION_PROVIDER: ${TRANSCRIPTION_PROVIDER:-mock}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_TRANSCRIPTION_MODEL: ${OPENAI_TRANSCRIPTION_MODEL:-gpt-transcribe}
 
+      # Local Whisper
       LOCAL_WHISPER_MODEL: ${LOCAL_WHISPER_MODEL:-small.en}
       LOCAL_WHISPER_DEVICE: ${LOCAL_WHISPER_DEVICE:-cpu}
       LOCAL_WHISPER_COMPUTE_TYPE: ${LOCAL_WHISPER_COMPUTE_TYPE:-int8}
       LOCAL_WHISPER_DOWNLOAD_ROOT: ${LOCAL_WHISPER_DOWNLOAD_ROOT:-/models}
 
-
-            # Text encoder
+      # Text encoder
       TEXT_ENCODER_PROVIDER: ${TEXT_ENCODER_PROVIDER:-mpnet}
       TEXT_ENCODER_MODEL: ${TEXT_ENCODER_MODEL:-sentence-transformers/all-mpnet-base-v2}
       TEXT_ENCODER_REVISION: ${TEXT_ENCODER_REVISION:-}
       TEXT_ENCODER_DEVICE: ${TEXT_ENCODER_DEVICE:-cpu}
       TEXT_ENCODER_CACHE_PATH: ${TEXT_ENCODER_CACHE_PATH:-/text-models}
 
+      # Audio encoder
+      AUDIO_ENCODER_PROVIDER: ${AUDIO_ENCODER_PROVIDER:-wavlm}
+      AUDIO_ENCODER_MODEL: ${AUDIO_ENCODER_MODEL:-microsoft/wavlm-base-plus}
+      AUDIO_ENCODER_REVISION: ${AUDIO_ENCODER_REVISION:-4c66d4806a428f2e922ccfa1a962776e232d487b}
+      AUDIO_ENCODER_DEVICE: ${AUDIO_ENCODER_DEVICE:-cpu}
+      AUDIO_ENCODER_CACHE_PATH: ${AUDIO_ENCODER_CACHE_PATH:-/audio-models}
 
     depends_on:
       postgres:
@@ -102,35 +123,44 @@ services:
         condition: service_healthy
       api:
         condition: service_started
+
     command:
-        - celery
-        - -A
-        - app.tasks.celery_app.celery_app
-        - worker
-        - --loglevel=info
-        - --concurrency=1
+      - celery
+      - -A
+      - app.tasks.celery_app.celery_app
+      - worker
+      - --loglevel=info
+      - --concurrency=1
+
     volumes:
       - ./apps/api:/app
       - audio_data:/data/audio
       - whisper_models:/models
       - text_models:/text-models
+      - audio_models:/audio-models
 
   web:
     build:
       context: ./apps/web
+
     environment:
       NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://localhost:8000}
+
     ports:
       - "3000:3000"
+
     depends_on:
       - api
+
     volumes:
       - ./apps/web:/app
       - /app/node_modules
       - /app/.next
+
 
 volumes:
   postgres_data:
   audio_data:
   whisper_models:
   text_models:
+  audio_models:

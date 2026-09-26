@@ -26,6 +26,9 @@ from app.services.features.audio_quality import (
 from app.services.features.audio_quality_policy import (
     AudioQualityAssessment,
 )
+from app.services.features.mock_audio_encoder import (
+    MockAudioEncoder,
+)
 
 
 def make_user() -> User:
@@ -143,6 +146,17 @@ def install_fake_audio_dependencies(
     journal: JournalEntry,
     pipeline_result: AudioPipelineResult,
 ):
+    """
+    Install deterministic test doubles around the audio feature
+    extraction service.
+
+    M3.4 preprocessing is replaced with the supplied pipeline result,
+    while M3.6 uses the deterministic MockAudioEncoder.
+
+    This keeps the service tests fast and prevents WavLM from being
+    loaded during ordinary regression tests.
+    """
+
     class FakeStorage:
         def get(self, key: str) -> bytes:
             assert (
@@ -151,6 +165,10 @@ def install_fake_audio_dependencies(
             )
 
             return b"encoded-audio"
+
+    mock_audio_encoder = (
+        MockAudioEncoder()
+    )
 
     monkeypatch.setattr(
         "app.services.features.audio_features."
@@ -162,6 +180,119 @@ def install_fake_audio_dependencies(
         "app.services.features.audio_features."
         "process_audio",
         lambda audio_bytes: pipeline_result,
+    )
+
+    monkeypatch.setattr(
+        "app.services.features.audio_features."
+        "get_audio_encoder",
+        lambda: mock_audio_encoder,
+    )
+
+    return mock_audio_encoder
+
+
+def assert_valid_mock_audio_embedding(
+    audio_feature,
+) -> None:
+    """
+    Assert the frozen M3.6 learned-audio persistence contract.
+    """
+
+    assert (
+        audio_feature.encoder_name
+        == "mock-audio-encoder"
+    )
+
+    assert (
+        audio_feature.encoder_version
+        == "audio-encoder-v1"
+    )
+
+    assert (
+        audio_feature.encoder_revision
+        == "deterministic-v1"
+    )
+
+    assert (
+        audio_feature.embedding_dimension
+        == 768
+    )
+
+    assert (
+        audio_feature.embedding
+        is not None
+    )
+
+    embedding = np.asarray(
+        audio_feature.embedding,
+        dtype=np.float32,
+    )
+
+    assert embedding.shape == (
+        768,
+    )
+
+    assert np.all(
+        np.isfinite(embedding)
+    )
+
+    assert np.linalg.norm(
+        embedding.astype(np.float64)
+    ) == pytest.approx(
+        1.0,
+        abs=1e-6,
+    )
+
+
+def assert_valid_audio_embedding_metadata(
+    metadata: dict,
+) -> None:
+    """
+    Assert provenance for the M3.6 learned representation.
+    """
+
+    assert (
+        "audio_embedding"
+        in metadata
+    )
+
+    embedding_metadata = metadata[
+        "audio_embedding"
+    ]
+
+    assert (
+        embedding_metadata["encoder_name"]
+        == "mock-audio-encoder"
+    )
+
+    assert (
+        embedding_metadata["encoder_version"]
+        == "audio-encoder-v1"
+    )
+
+    assert (
+        embedding_metadata["encoder_revision"]
+        == "deterministic-v1"
+    )
+
+    assert (
+        embedding_metadata["embedding_dimension"]
+        == 768
+    )
+
+    assert (
+        embedding_metadata["sample_rate_hz"]
+        == 16_000
+    )
+
+    assert (
+        embedding_metadata["pooling_strategy"]
+        == "masked_temporal_mean"
+    )
+
+    assert (
+        embedding_metadata["normalization"]
+        == "l2"
     )
 
 
@@ -229,18 +360,29 @@ def test_audio_features_are_persisted(
         == "audio-preprocess-v1"
     )
 
-    # Acoustic encoder has not been introduced
-    # yet. These remain NULL until M3.6.
-    assert audio_feature.encoder_name is None
-
-    assert (
-        audio_feature.encoder_version
-        is None
+    # M3.6 learned audio representation.
+    assert_valid_mock_audio_embedding(
+        audio_feature
     )
 
     assert (
-        audio_feature.embedding_dimension
-        is None
+        result.audio_encoding.encoder_name
+        == "mock-audio-encoder"
+    )
+
+    assert (
+        result.audio_encoding.encoder_version
+        == "audio-encoder-v1"
+    )
+
+    assert (
+        result.audio_encoding.encoder_revision
+        == "deterministic-v1"
+    )
+
+    assert (
+        result.audio_encoding.embedding_dimension
+        == 768
     )
 
     assert (
@@ -341,6 +483,11 @@ def test_audio_features_are_persisted(
         == pytest.approx(0.0)
     )
 
+    # M3.6 representation provenance.
+    assert_valid_audio_embedding_metadata(
+        metadata
+    )
+
     # A VOICE feature generation requires
     # both modalities. Audio alone must not
     # complete the feature generation.
@@ -402,7 +549,7 @@ def test_audio_completes_generation_when_text_exists(
         pipeline_result=expected,
     )
 
-    extract_audio_features(
+    result = extract_audio_features(
         db_session,
         journal=journal,
         feature_set=feature_set,
@@ -421,6 +568,10 @@ def test_audio_completes_generation_when_text_exists(
     assert (
         feature_set.text_feature
         is not None
+    )
+
+    assert_valid_mock_audio_embedding(
+        result.audio_feature
     )
 
 
@@ -493,6 +644,13 @@ def test_unusable_audio_is_still_persisted(
     assert (
         feature_set.status
         == FEATURE_STATUS_PROCESSING
+    )
+
+    # M3.6 currently preserves the representation
+    # even when engineering quality is UNUSABLE.
+    # Downstream consumers must inspect quality_status.
+    assert_valid_mock_audio_embedding(
+        result.audio_feature
     )
 
 
@@ -602,25 +760,14 @@ def test_feature_set_must_belong_to_journal(
             journal=journal,
             feature_set=feature_set,
         )
-        
+
+
 def test_audio_extraction_persists_acoustic_features(
     db_session,
     monkeypatch,
 ):
     import io
     import wave
-
-    import numpy as np
-
-    from app.models.journal import JournalEntry
-    from app.models.journal_audio import JournalAudio
-    from app.models.journal_feature_set import (
-        JournalFeatureSet,
-    )
-    from app.models.user import User
-    from app.services.features.audio_features import (
-        extract_audio_features,
-    )
 
     sample_rate = 16_000
     duration_seconds = 1.0
@@ -728,6 +875,16 @@ def test_audio_extraction_persists_acoustic_features(
         lambda: FakeStorage(),
     )
 
+    mock_audio_encoder = (
+        MockAudioEncoder()
+    )
+
+    monkeypatch.setattr(
+        "app.services.features.audio_features."
+        "get_audio_encoder",
+        lambda: mock_audio_encoder,
+    )
+
     result = extract_audio_features(
         db_session,
         journal=journal,
@@ -830,23 +987,18 @@ def test_audio_extraction_persists_acoustic_features(
         is None
     )
 
-    # Learned representation belongs to M3.6.
-    assert (
-        audio_feature.encoder_name
-        is None
+    # M3.6 learned representation now coexists
+    # with the deterministic M3.5 representation.
+    assert_valid_mock_audio_embedding(
+        audio_feature
     )
 
-    assert (
-        audio_feature.encoder_version
-        is None
+    assert_valid_audio_embedding_metadata(
+        metadata
     )
 
-    assert (
-        audio_feature.embedding_dimension
-        is None
-    )
-
-    # Returned domain representation must match persistence.
+    # Returned domain representation must match
+    # persistence.
     assert (
         result.acoustic_features.feature_version
         == acoustic["feature_version"]
@@ -857,4 +1009,18 @@ def test_audio_extraction_persists_acoustic_features(
             result.acoustic_features.mfcc_mean
         )
         == acoustic["mfcc_mean"]
+    )
+
+    # Returned M3.6 representation must also
+    # match persistence.
+    persisted_embedding = np.asarray(
+        audio_feature.embedding,
+        dtype=np.float32,
+    )
+
+    np.testing.assert_allclose(
+        persisted_embedding,
+        result.audio_encoding.embedding,
+        rtol=0.0,
+        atol=1e-7,
     )

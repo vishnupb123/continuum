@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
+from pgvector.sqlalchemy import VECTOR
 from sqlalchemy import (
     DateTime,
     Float,
@@ -13,6 +14,9 @@ from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+
+AUDIO_EMBEDDING_DIMENSION = 768
 
 
 class AudioFeature(Base):
@@ -50,8 +54,18 @@ class AudioFeature(Base):
         nullable=True,
     )
 
+    encoder_revision: Mapped[str | None] = mapped_column(
+        String(255),
+        nullable=True,
+    )
+
     embedding_dimension: Mapped[int | None] = mapped_column(
         Integer,
+        nullable=True,
+    )
+
+    embedding: Mapped[list[float] | None] = mapped_column(
+        VECTOR(AUDIO_EMBEDDING_DIMENSION),
         nullable=True,
     )
 

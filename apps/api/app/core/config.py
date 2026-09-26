@@ -28,5 +28,13 @@ class Settings(BaseSettings):
     text_encoder_device: str = "cpu"
 
     text_encoder_cache_path: str = "/text-models"
+    
+    audio_encoder_provider: str = "wavlm"
+    audio_encoder_model: str = "microsoft/wavlm-base-plus"
+    audio_encoder_revision: str | None = (
+      "4c66d4806a428f2e922ccfa1a962776e232d487b"
+    )
+    audio_encoder_device: str = "cpu"
+    audio_encoder_cache_path: str = "/audio-models"
 
 settings = Settings()

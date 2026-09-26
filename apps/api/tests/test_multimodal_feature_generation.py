@@ -2,6 +2,7 @@ import io
 import wave
 
 import numpy as np
+import pytest
 
 from app.models.journal import JournalEntry
 from app.models.journal_audio import JournalAudio
@@ -9,6 +10,9 @@ from app.models.journal_feature_set import JournalFeatureSet
 from app.models.user import User
 from app.services.features.audio_features import (
     extract_audio_features,
+)
+from app.services.features.mock_audio_encoder import (
+    MockAudioEncoder,
 )
 from app.services.features.text_features import (
     extract_text_features,
@@ -167,6 +171,20 @@ def test_voice_generation_completes_with_text_then_audio(
         ),
     )
 
+    mock_audio_encoder = (
+        MockAudioEncoder()
+    )
+
+    monkeypatch.setattr(
+        "app.services.features.audio_features."
+        "get_audio_encoder",
+        lambda: mock_audio_encoder,
+    )
+
+    # ---------------------------------------------------------
+    # Text representation
+    # ---------------------------------------------------------
+
     text_result = extract_text_features(
         db_session,
         journal=journal,
@@ -195,6 +213,10 @@ def test_voice_generation_completes_with_text_then_audio(
         is None
     )
 
+    # ---------------------------------------------------------
+    # Audio representations
+    # ---------------------------------------------------------
+
     audio_result = extract_audio_features(
         db_session,
         journal=journal,
@@ -211,6 +233,7 @@ def test_voice_generation_completes_with_text_then_audio(
         is not None
     )
 
+    # Both modalities now exist.
     assert (
         feature_set.status
         == "COMPLETED"
@@ -231,7 +254,10 @@ def test_voice_generation_completes_with_text_then_audio(
         is audio_result.audio_feature
     )
 
-    # Text representation contract.
+    # ---------------------------------------------------------
+    # Text representation contract
+    # ---------------------------------------------------------
+
     assert (
         feature_set.text_feature.embedding
         is not None
@@ -242,7 +268,10 @@ def test_voice_generation_completes_with_text_then_audio(
         == 768
     )
 
-    # Acoustic representation contract.
+    # ---------------------------------------------------------
+    # M3.5 deterministic acoustic representation
+    # ---------------------------------------------------------
+
     metadata = (
         feature_set.audio_feature
         .feature_metadata
@@ -275,29 +304,157 @@ def test_voice_generation_completes_with_text_then_audio(
         acoustic["mfcc_std"]
     ) == 13
 
-    # M3.5 must not claim VAD.
+    # M3.5 signal activity must not be
+    # misrepresented as speech/VAD.
     assert (
         feature_set.audio_feature
         .speech_ratio
         is None
     )
 
-    # Learned audio embeddings belong
-    # exclusively to M3.6.
-    assert (
+    # ---------------------------------------------------------
+    # M3.6 learned audio representation
+    # ---------------------------------------------------------
+
+    audio_feature = (
         feature_set.audio_feature
-        .encoder_name
-        is None
     )
 
     assert (
-        feature_set.audio_feature
-        .encoder_version
-        is None
+        audio_feature.encoder_name
+        == "mock-audio-encoder"
     )
 
     assert (
-        feature_set.audio_feature
-        .embedding_dimension
-        is None
+        audio_feature.encoder_version
+        == "audio-encoder-v1"
+    )
+
+    assert (
+        audio_feature.encoder_revision
+        == "deterministic-v1"
+    )
+
+    assert (
+        audio_feature.embedding_dimension
+        == 768
+    )
+
+    assert (
+        audio_feature.embedding
+        is not None
+    )
+
+    audio_embedding = np.asarray(
+        audio_feature.embedding,
+        dtype=np.float32,
+    )
+
+    assert audio_embedding.shape == (
+        768,
+    )
+
+    assert np.all(
+        np.isfinite(
+            audio_embedding
+        )
+    )
+
+    assert np.linalg.norm(
+        audio_embedding.astype(
+            np.float64
+        )
+    ) == pytest.approx(
+        1.0,
+        abs=1e-6,
+    )
+
+    # Returned representation must match
+    # what was persisted.
+    np.testing.assert_allclose(
+        audio_embedding,
+        audio_result.audio_encoding.embedding,
+        rtol=0.0,
+        atol=1e-7,
+    )
+
+    # ---------------------------------------------------------
+    # M3.6 representation provenance
+    # ---------------------------------------------------------
+
+    assert (
+        "audio_embedding"
+        in metadata
+    )
+
+    embedding_metadata = metadata[
+        "audio_embedding"
+    ]
+
+    assert (
+        embedding_metadata[
+            "encoder_name"
+        ]
+        == "mock-audio-encoder"
+    )
+
+    assert (
+        embedding_metadata[
+            "encoder_version"
+        ]
+        == "audio-encoder-v1"
+    )
+
+    assert (
+        embedding_metadata[
+            "encoder_revision"
+        ]
+        == "deterministic-v1"
+    )
+
+    assert (
+        embedding_metadata[
+            "embedding_dimension"
+        ]
+        == 768
+    )
+
+    assert (
+        embedding_metadata[
+            "sample_rate_hz"
+        ]
+        == 16_000
+    )
+
+    assert (
+        embedding_metadata[
+            "pooling_strategy"
+        ]
+        == "masked_temporal_mean"
+    )
+
+    assert (
+        embedding_metadata[
+            "normalization"
+        ]
+        == "l2"
+    )
+
+    # ---------------------------------------------------------
+    # Final multimodal contract
+    # ---------------------------------------------------------
+
+    assert (
+        feature_set.text_feature.embedding
+        is not None
+    )
+
+    assert (
+        feature_set.audio_feature.embedding
+        is not None
+    )
+
+    assert (
+        feature_set.status
+        == "COMPLETED"
     )
