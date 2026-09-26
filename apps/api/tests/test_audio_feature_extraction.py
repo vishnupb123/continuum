@@ -602,3 +602,259 @@ def test_feature_set_must_belong_to_journal(
             journal=journal,
             feature_set=feature_set,
         )
+        
+def test_audio_extraction_persists_acoustic_features(
+    db_session,
+    monkeypatch,
+):
+    import io
+    import wave
+
+    import numpy as np
+
+    from app.models.journal import JournalEntry
+    from app.models.journal_audio import JournalAudio
+    from app.models.journal_feature_set import (
+        JournalFeatureSet,
+    )
+    from app.models.user import User
+    from app.services.features.audio_features import (
+        extract_audio_features,
+    )
+
+    sample_rate = 16_000
+    duration_seconds = 1.0
+
+    time = (
+        np.arange(
+            int(
+                sample_rate
+                * duration_seconds
+            ),
+            dtype=np.float64,
+        )
+        / sample_rate
+    )
+
+    waveform = (
+        0.25
+        * np.sin(
+            2.0
+            * np.pi
+            * 440.0
+            * time
+        )
+    )
+
+    pcm = (
+        waveform
+        * 32767.0
+    ).astype(
+        np.int16
+    )
+
+    buffer = io.BytesIO()
+
+    with wave.open(
+        buffer,
+        "wb",
+    ) as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(
+            sample_rate
+        )
+        wav_file.writeframes(
+            pcm.tobytes()
+        )
+
+    audio_bytes = buffer.getvalue()
+
+    user = User(
+        email="acoustic-persistence@example.com",
+        password_hash="test-password-hash",
+    )
+
+    db_session.add(user)
+    db_session.flush()
+
+    journal = JournalEntry(
+        user_id=user.id,
+        entry_type="VOICE",
+        raw_text="Test transcript.",
+        status="COMPLETED",
+    )
+
+    db_session.add(journal)
+    db_session.flush()
+
+    journal_audio = JournalAudio(
+        journal_id=journal.id,
+        storage_key="test/acoustic.wav",
+        original_filename="acoustic.wav",
+        mime_type="audio/wav",
+        size_bytes=len(audio_bytes),
+        transcription_status="TRANSCRIBED",
+    )
+
+    db_session.add(journal_audio)
+    db_session.flush()
+
+    feature_set = JournalFeatureSet(
+        journal_id=journal.id,
+        pipeline_version="m3-v1",
+        source_hash="acoustic-test-hash",
+        status="PENDING",
+    )
+
+    db_session.add(feature_set)
+    db_session.flush()
+
+    class FakeStorage:
+        def get(
+            self,
+            key: str,
+        ) -> bytes:
+            assert (
+                key
+                == "test/acoustic.wav"
+            )
+
+            return audio_bytes
+
+    monkeypatch.setattr(
+        "app.services.features.audio_features."
+        "get_audio_storage",
+        lambda: FakeStorage(),
+    )
+
+    result = extract_audio_features(
+        db_session,
+        journal=journal,
+        feature_set=feature_set,
+    )
+
+    audio_feature = (
+        result.audio_feature
+    )
+
+    metadata = (
+        audio_feature.feature_metadata
+    )
+
+    assert (
+        "acoustic_features"
+        in metadata
+    )
+
+    acoustic = metadata[
+        "acoustic_features"
+    ]
+
+    assert (
+        acoustic["feature_version"]
+        == "acoustic-features-v1"
+    )
+
+    assert acoustic["frame_count"] > 0
+
+    assert (
+        0.0
+        <= acoustic[
+            "signal_activity_ratio"
+        ]
+        <= 1.0
+    )
+
+    assert (
+        acoustic[
+            "signal_activity_ratio"
+        ]
+        + acoustic[
+            "signal_inactivity_ratio"
+        ]
+        == pytest.approx(1.0)
+    )
+
+    assert np.isfinite(
+        acoustic["rms_mean"]
+    )
+
+    assert np.isfinite(
+        acoustic[
+            "spectral_centroid_mean_hz"
+        ]
+    )
+
+    assert np.isfinite(
+        acoustic[
+            "spectral_bandwidth_mean_hz"
+        ]
+    )
+
+    assert np.isfinite(
+        acoustic[
+            "spectral_rolloff_mean_hz"
+        ]
+    )
+
+    assert np.isfinite(
+        acoustic[
+            "zero_crossing_rate_mean"
+        ]
+    )
+
+    assert len(
+        acoustic["mfcc_mean"]
+    ) == 13
+
+    assert len(
+        acoustic["mfcc_std"]
+    ) == 13
+
+    assert np.all(
+        np.isfinite(
+            acoustic["mfcc_mean"]
+        )
+    )
+
+    assert np.all(
+        np.isfinite(
+            acoustic["mfcc_std"]
+        )
+    )
+
+    # M3.5 signal activity is NOT VAD.
+    assert (
+        audio_feature.speech_ratio
+        is None
+    )
+
+    # Learned representation belongs to M3.6.
+    assert (
+        audio_feature.encoder_name
+        is None
+    )
+
+    assert (
+        audio_feature.encoder_version
+        is None
+    )
+
+    assert (
+        audio_feature.embedding_dimension
+        is None
+    )
+
+    # Returned domain representation must match persistence.
+    assert (
+        result.acoustic_features.feature_version
+        == acoustic["feature_version"]
+    )
+
+    assert (
+        list(
+            result.acoustic_features.mfcc_mean
+        )
+        == acoustic["mfcc_mean"]
+    )

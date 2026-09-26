@@ -1,6 +1,8 @@
 import uuid
 from datetime import datetime, timezone
 
+from pgvector.sqlalchemy import Vector
+
 from sqlalchemy import (
     DateTime,
     ForeignKey,
@@ -48,6 +50,11 @@ class TextFeature(Base):
         String(255),
         nullable=True,
     )
+    
+    encoder_revision: Mapped[str | None] = mapped_column(
+        String(100),
+        nullable=True,
+   )
 
     encoder_version: Mapped[str | None] = mapped_column(
         String(255),
@@ -56,6 +63,11 @@ class TextFeature(Base):
 
     embedding_dimension: Mapped[int | None] = mapped_column(
         Integer,
+        nullable=True,
+    )
+    
+    embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(768),
         nullable=True,
     )
 
@@ -92,3 +104,4 @@ class TextFeature(Base):
         "JournalFeatureSet",
         back_populates="text_feature",
     )
+    

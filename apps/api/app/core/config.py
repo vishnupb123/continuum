@@ -17,5 +17,16 @@ class Settings(BaseSettings):
     local_whisper_device: str = "cpu"
     local_whisper_compute_type: str = "int8"
     local_whisper_download_root: str = "/models"
+    text_encoder_provider: str = "mpnet"
+
+    text_encoder_model: str = (
+      "sentence-transformers/all-mpnet-base-v2"
+    )
+
+    text_encoder_revision: str | None = None
+
+    text_encoder_device: str = "cpu"
+
+    text_encoder_cache_path: str = "/text-models"
 
 settings = Settings()

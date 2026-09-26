@@ -7,9 +7,21 @@ from app.models import JournalAudio, JournalEntry, StateObservation
 from app.services.mock_context_model import MockContextModel
 from app.services.storage.factory import get_audio_storage
 from app.services.transcription.factory import get_transcription_provider
+from app.tasks.feature_tasks import (
+    extract_journal_text_features,
+)
 from app.tasks.celery_app import celery_app
 
+def _queue_text_feature_extraction(
+    journal_id: str,
+) -> None:
+    from app.tasks.feature_tasks import (
+        extract_journal_text_features,
+    )
 
+    extract_journal_text_features.delay(
+        journal_id
+    )
 @celery_app.task(
     name="app.tasks.journal_tasks.process_journal",
     autoretry_for=(ConnectionError,),
@@ -19,70 +31,110 @@ from app.tasks.celery_app import celery_app
 def process_journal(journal_id: str):
     db = SessionLocal()
 
+    journal_uuid = UUID(journal_id)
+    should_queue_features = False
+    result_status = None
+
     try:
         journal = db.get(
             JournalEntry,
-            UUID(journal_id),
+            journal_uuid,
         )
 
         if journal is None:
-            return {"status": "missing"}
+            return {
+                "status": "missing"
+            }
 
+        # -------------------------------------------------
+        # RECOVERY / IDEMPOTENCY PATH
+        # -------------------------------------------------
+        #
+        # Analysis may already be complete while the
+        # downstream feature dispatch previously failed.
+        #
+        # Re-running this task must repair that handoff.
+        #
         if journal.status == "COMPLETED":
-            return {"status": "already_completed"}
-
-        # A VOICE journal must never enter analysis until
-        # transcription has produced usable text.
-        if (
-            journal.entry_type == "VOICE"
-            and (
-                journal.raw_text is None
-                or not journal.raw_text.strip()
-            )
-        ):
-            return {"status": "transcript_missing"}
-
-        journal.status = "PROCESSING"
-        journal.error_message = None
-        db.commit()
-
-        existing = db.scalar(
-            select(StateObservation).where(
-                StateObservation.journal_id == journal.id
-            )
-        )
-
-        if existing is None:
-            result = MockContextModel().predict(
-                journal.raw_text
+            should_queue_features = True
+            result_status = (
+                "already_completed"
             )
 
-            db.add(
-                StateObservation(
-                    journal_id=journal.id,
-                    energy=result.energy,
-                    stress=result.stress,
-                    confidence=result.confidence,
-                    model_version=result.model_version,
+        else:
+            # A VOICE journal must never enter analysis
+            # until transcription has produced usable
+            # text.
+            if (
+                journal.entry_type == "VOICE"
+                and (
+                    journal.raw_text is None
+                    or not journal.raw_text.strip()
+                )
+            ):
+                return {
+                    "status":
+                    "transcript_missing"
+                }
+
+            journal.status = "PROCESSING"
+            journal.error_message = None
+            db.commit()
+
+            existing = db.scalar(
+                select(
+                    StateObservation
+                ).where(
+                    StateObservation.journal_id
+                    == journal.id
                 )
             )
 
-        journal.status = "COMPLETED"
-        db.commit()
+            if existing is None:
+                result = (
+                    MockContextModel()
+                    .predict(
+                        journal.raw_text
+                    )
+                )
 
-        return {"status": "completed"}
+                db.add(
+                    StateObservation(
+                        journal_id=journal.id,
+                        energy=result.energy,
+                        stress=result.stress,
+                        confidence=(
+                            result.confidence
+                        ),
+                        model_version=(
+                            result.model_version
+                        ),
+                    )
+                )
+
+            journal.status = "COMPLETED"
+
+            # Analysis completion is committed before
+            # M3 dispatch. Journal state therefore does
+            # not depend on feature extraction.
+            db.commit()
+
+            should_queue_features = True
+            result_status = "completed"
 
     except Exception:
         db.rollback()
 
         journal = db.get(
             JournalEntry,
-            UUID(journal_id),
+            journal_uuid,
         )
 
         if journal is not None:
             journal.status = "FAILED"
-            journal.error_message = "Processing failed"
+            journal.error_message = (
+                "Processing failed"
+            )
             db.commit()
 
         raise
@@ -90,7 +142,26 @@ def process_journal(journal_id: str):
     finally:
         db.close()
 
+    # -----------------------------------------------------
+    # M3 DOWNSTREAM HANDOFF
+    # -----------------------------------------------------
+    #
+    # Deliberately outside the analysis transaction.
+    #
+    # If Redis/Celery dispatch fails, the journal remains
+    # COMPLETED. Re-running process_journal() enters the
+    # recovery path above and retries this dispatch.
+    #
+    if should_queue_features:
+        _queue_text_feature_extraction(
+            str(journal_uuid)
+        )
 
+    return {
+        "status": result_status,
+        "features": "queued",
+    }
+    
 @celery_app.task(
     name="app.tasks.journal_tasks.transcribe_journal_audio",
     autoretry_for=(ConnectionError,),

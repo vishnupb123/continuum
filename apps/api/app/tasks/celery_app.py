@@ -7,7 +7,10 @@ celery_app = Celery(
     "continuum",
     broker=settings.redis_url,
     backend=settings.redis_url,
-    include=["app.tasks.journal_tasks"],
+    include=[
+    "app.tasks.journal_tasks",
+    "app.tasks.feature_tasks",
+  ],
 )
 
 celery_app.conf.update(
