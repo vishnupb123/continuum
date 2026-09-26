@@ -5,27 +5,38 @@ import pytest
 from app.models.feature_constants import (
     FEATURE_STATUS_COMPLETED,
     FEATURE_STATUS_FAILED,
+    FEATURE_STATUS_PENDING,
 )
 from app.models.journal import JournalEntry
+from app.models.journal_audio import JournalAudio
 from app.models.journal_feature_set import (
     JournalFeatureSet,
 )
 from app.models.user import User
-from app.tasks.feature_tasks import (
-    extract_journal_text_features,
+from app.services.features.feature_sets import (
+    resolve_feature_set,
 )
 from app.services.features.text_encoder.base import (
     TextEncodingResult,
 )
+from app.tasks.feature_tasks import (
+    extract_journal_audio_features,
+    extract_journal_text_features,
+)
 
 
-def make_completed_journal(
+# ============================================================
+# TEST HELPERS
+# ============================================================
+
+
+def make_completed_text_journal(
     db_session,
 ):
     user = User(
-        email="feature-task@example.com",
+        email="feature-task-text@example.com",
         password_hash="test-password-hash",
-        display_name="Feature Task User",
+        display_name="Feature Task Text User",
     )
 
     db_session.add(user)
@@ -48,6 +59,96 @@ def make_completed_journal(
     return journal
 
 
+def make_completed_voice_journal(
+    db_session,
+):
+    user = User(
+        email="feature-task-voice@example.com",
+        password_hash="test-password-hash",
+        display_name="Feature Task Voice User",
+    )
+
+    db_session.add(user)
+    db_session.flush()
+
+    journal = JournalEntry(
+        user_id=user.id,
+        entry_type="VOICE",
+        raw_text=(
+            "This is the transcript for a completed "
+            "voice journal used in orchestration tests."
+        ),
+        status="COMPLETED",
+    )
+
+    db_session.add(journal)
+    db_session.flush()
+
+    audio = JournalAudio(
+        journal_id=journal.id,
+        storage_key=(
+            "tests/feature-task-voice.wav"
+        ),
+        original_filename=(
+            "feature-task-voice.wav"
+        ),
+        mime_type="audio/wav",
+        size_bytes=123,
+        transcription_status=(
+            "TRANSCRIPTION_COMPLETED"
+        ),
+    )
+
+    db_session.add(audio)
+    db_session.commit()
+    db_session.refresh(journal)
+
+    return journal
+
+
+def make_feature_set(
+    db_session,
+    *,
+    journal,
+    source_hash: str,
+):
+    resolution = resolve_feature_set(
+        db_session,
+        journal_id=journal.id,
+        source_hash=source_hash,
+    )
+
+    db_session.commit()
+
+    return resolution.feature_set
+
+
+def make_text_encoding_result():
+    embedding = [0.0] * 768
+    embedding[0] = 1.0
+
+    return TextEncodingResult(
+        embedding=tuple(embedding),
+        dimension=768,
+        encoder_name=(
+            "sentence-transformers/"
+            "all-mpnet-base-v2"
+        ),
+        encoder_version=(
+            "text-encoder-v1"
+        ),
+        encoder_revision=(
+            "e8c3b32edf5434bc2275fc9bab85f82640a19130"
+        ),
+        normalized=True,
+    )
+
+
+# ============================================================
+# TEXT FAILURE ISOLATION
+# ============================================================
+
+
 @patch(
     "app.tasks.feature_tasks.SessionLocal"
 )
@@ -55,26 +156,32 @@ def make_completed_journal(
     "app.tasks.feature_tasks."
     "extract_text_features"
 )
-def test_feature_failure_does_not_fail_journal(
+def test_text_feature_failure_does_not_fail_journal(
     extract_mock,
     session_local_mock,
     db_session,
 ):
-    # The Celery task normally creates its own
-    # production DB session.
-    #
-    # During this test, force it to use the pytest
-    # database session so the task can see the
-    # journal created below.
     session_local_mock.return_value = (
         db_session
     )
 
-    journal = make_completed_journal(
+    journal = make_completed_text_journal(
         db_session
     )
 
+    # Capture UUID before the Celery task closes
+    # the patched SQLAlchemy session.
     journal_id = journal.id
+
+    feature_set = make_feature_set(
+        db_session,
+        journal=journal,
+        source_hash=(
+            "text-failure-source-hash"
+        ),
+    )
+
+    feature_set_id = feature_set.id
 
     extract_mock.side_effect = RuntimeError(
         "forced encoder failure"
@@ -85,54 +192,46 @@ def test_feature_failure_does_not_fail_journal(
         match="forced encoder failure",
     ):
         extract_journal_text_features.run(
-            str(journal_id)
+            str(journal_id),
+            str(feature_set_id),
         )
 
-    # Session.close() is called by the task's finally
-    # block. SQLAlchemy sessions can be reused after
-    # close(), so expire/query again from the fixture
-    # session.
     db_session.expire_all()
 
-    journal = db_session.get(
+    persisted_journal = db_session.get(
         JournalEntry,
         journal_id,
     )
 
-    assert journal is not None
+    assert persisted_journal is not None
 
     # Critical invariant:
     # M3 failure must never corrupt successful
-    # journal processing.
-    assert journal.status == "COMPLETED"
-
-    feature_sets = (
-        db_session.query(
-            JournalFeatureSet
-        )
-        .filter(
-            JournalFeatureSet.journal_id
-            == journal_id
-        )
-        .all()
+    # M2 journal processing.
+    assert (
+        persisted_journal.status
+        == "COMPLETED"
     )
 
-    # Exactly one generation should exist.
-    assert len(feature_sets) == 1
+    persisted_feature_set = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
+    )
 
-    feature_set = feature_sets[0]
+    assert persisted_feature_set is not None
 
     assert (
-        feature_set.status
+        persisted_feature_set.status
         == FEATURE_STATUS_FAILED
     )
 
-    # Failed extraction must not leave a partial
-    # TextFeature behind.
-    assert feature_set.text_feature is None
+    assert (
+        persisted_feature_set.text_feature
+        is None
+    )
 
     assert (
-        feature_set.error_message
+        persisted_feature_set.error_message
         == (
             "Text feature extraction failed: "
             "RuntimeError"
@@ -140,7 +239,13 @@ def test_feature_failure_does_not_fail_journal(
     )
 
     extract_mock.assert_called_once()
-    
+
+
+# ============================================================
+# TEXT RETRY / GENERATION REUSE
+# ============================================================
+
+
 @patch(
     "app.tasks.feature_tasks.SessionLocal"
 )
@@ -148,7 +253,7 @@ def test_feature_failure_does_not_fail_journal(
     "app.services.features.text_features."
     "get_text_encoder"
 )
-def test_failed_generation_is_reused_and_completes_on_retry(
+def test_failed_text_generation_recovers_using_same_feature_set(
     get_text_encoder_mock,
     session_local_mock,
     db_session,
@@ -157,19 +262,31 @@ def test_failed_generation_is_reused_and_completes_on_retry(
         db_session
     )
 
-    journal = make_completed_journal(
+    journal = make_completed_text_journal(
         db_session
     )
 
+    # Capture IDs before task execution because the
+    # task owns/closes the patched session.
     journal_id = journal.id
 
-    # ---------------------------------------------
-    # FIRST ATTEMPT — FORCE ENCODER FAILURE
-    # ---------------------------------------------
+    feature_set = make_feature_set(
+        db_session,
+        journal=journal,
+        source_hash=(
+            "text-recovery-source-hash"
+        ),
+    )
+
+    feature_set_id = feature_set.id
 
     encoder = (
         get_text_encoder_mock.return_value
     )
+
+    # --------------------------------------------------------
+    # FIRST ATTEMPT — FORCE FAILURE
+    # --------------------------------------------------------
 
     encoder.encode.side_effect = RuntimeError(
         "forced encoder failure"
@@ -180,33 +297,22 @@ def test_failed_generation_is_reused_and_completes_on_retry(
         match="forced encoder failure",
     ):
         extract_journal_text_features.run(
-            str(journal_id)
+            str(journal_id),
+            str(feature_set_id),
         )
 
     db_session.expire_all()
 
-    failed_sets = (
-        db_session.query(
-            JournalFeatureSet
-        )
-        .filter(
-            JournalFeatureSet.journal_id
-            == journal_id
-        )
-        .all()
+    failed_feature_set = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
     )
 
-    assert len(failed_sets) == 1
-
-    failed_feature_set = failed_sets[0]
+    assert failed_feature_set is not None
 
     assert (
         failed_feature_set.status
         == FEATURE_STATUS_FAILED
-    )
-
-    original_feature_set_id = (
-        failed_feature_set.id
     )
 
     assert (
@@ -214,120 +320,734 @@ def test_failed_generation_is_reused_and_completes_on_retry(
         is None
     )
 
-    # ---------------------------------------------
-    # SECOND ATTEMPT — ENCODER RECOVERS
-    # ---------------------------------------------
+    # --------------------------------------------------------
+    # PARENT-STYLE FAILED -> PENDING RECOVERY
+    # --------------------------------------------------------
 
-    embedding = [0.0] * 768
-    embedding[0] = 1.0
+    resolution = resolve_feature_set(
+        db_session,
+        journal_id=journal_id,
+        source_hash=(
+            "text-recovery-source-hash"
+        ),
+    )
+
+    assert (
+        resolution.feature_set.id
+        == feature_set_id
+    )
+
+    assert (
+        resolution.should_process
+        is True
+    )
+
+    assert (
+        resolution.feature_set.status
+        == FEATURE_STATUS_PENDING
+    )
+
+    db_session.commit()
+
+    # --------------------------------------------------------
+    # SECOND ATTEMPT — ENCODER RECOVERS
+    # --------------------------------------------------------
 
     encoder.encode.side_effect = None
+
     encoder.encode.return_value = (
-        TextEncodingResult(
-            embedding=tuple(embedding),
-            dimension=768,
-            encoder_name=(
-                "sentence-transformers/"
-                "all-mpnet-base-v2"
-            ),
-            encoder_version=(
-                "text-encoder-v1"
-            ),
-            encoder_revision=(
-                "e8c3b32edf5434bc2275fc9bab85f82640a19130"
-            ),
-            normalized=True,
-        )
+        make_text_encoding_result()
     )
 
     result = (
         extract_journal_text_features.run(
-            str(journal_id)
+            str(journal_id),
+            str(feature_set_id),
         )
     )
 
-    assert result["status"] == "completed"
+    assert (
+        result["status"]
+        == "completed"
+    )
 
     db_session.expire_all()
 
-    recovered_sets = (
-        db_session.query(
-            JournalFeatureSet
-        )
-        .filter(
-            JournalFeatureSet.journal_id
-            == journal_id
-        )
-        .all()
+    recovered = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
     )
 
-    # Critical idempotency invariant:
-    # retry must reuse the failed generation.
-    assert len(recovered_sets) == 1
+    assert recovered is not None
 
-    recovered_feature_set = (
-        recovered_sets[0]
+    # Critical invariant:
+    # retry uses the exact same generation.
+    assert (
+        recovered.id
+        == feature_set_id
     )
 
     assert (
-        recovered_feature_set.id
-        == original_feature_set_id
-    )
-
-    assert (
-        recovered_feature_set.status
+        recovered.status
         == FEATURE_STATUS_COMPLETED
     )
 
     assert (
-        recovered_feature_set.error_message
+        recovered.error_message
         is None
     )
 
     assert (
-        recovered_feature_set.completed_at
+        recovered.completed_at
         is not None
     )
 
     assert (
-        recovered_feature_set.text_feature
+        recovered.text_feature
         is not None
     )
 
-    text_feature = (
-        recovered_feature_set.text_feature
-    )
-
     assert (
-        text_feature.embedding_dimension
+        recovered.text_feature.embedding_dimension
         == 768
     )
 
     assert (
-        len(text_feature.embedding)
-        == 768
-    )
-
-    assert (
-        text_feature.encoder_version
+        recovered.text_feature.encoder_version
         == "text-encoder-v1"
     )
 
     assert (
-        text_feature.encoder_revision
+        recovered.text_feature.encoder_revision
         == (
             "e8c3b32edf5434bc2275fc9bab85f82640a19130"
         )
     )
 
-    # Journal remains independent from the M3
-    # failure/recovery lifecycle.
-    recovered_journal = db_session.get(
+    persisted_journal = db_session.get(
         JournalEntry,
         journal_id,
     )
 
+    assert persisted_journal is not None
+
     assert (
-        recovered_journal.status
+        persisted_journal.status
+        == "COMPLETED"
+    )
+
+
+# ============================================================
+# DUPLICATE TEXT DELIVERY
+# ============================================================
+
+
+@patch(
+    "app.tasks.feature_tasks.SessionLocal"
+)
+@patch(
+    "app.services.features.text_features."
+    "get_text_encoder"
+)
+def test_duplicate_text_delivery_does_not_reextract(
+    get_text_encoder_mock,
+    session_local_mock,
+    db_session,
+):
+    session_local_mock.return_value = (
+        db_session
+    )
+
+    journal = make_completed_text_journal(
+        db_session
+    )
+
+    journal_id = journal.id
+
+    feature_set = make_feature_set(
+        db_session,
+        journal=journal,
+        source_hash=(
+            "duplicate-text-source-hash"
+        ),
+    )
+
+    feature_set_id = feature_set.id
+
+    encoder = (
+        get_text_encoder_mock.return_value
+    )
+
+    encoder.encode.return_value = (
+        make_text_encoding_result()
+    )
+
+    first = (
+        extract_journal_text_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+    )
+
+    assert (
+        first["status"]
+        == "completed"
+    )
+
+    # First task invocation closes the patched
+    # session. The next invocation reuses the
+    # Session object through SessionLocal mock,
+    # which SQLAlchemy supports.
+    second = (
+        extract_journal_text_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+    )
+
+    assert (
+        second["status"]
+        == "already_extracted"
+    )
+
+    # Most important assertion:
+    # duplicate Celery delivery must not invoke
+    # the expensive encoder twice.
+    assert (
+        encoder.encode.call_count
+        == 1
+    )
+
+    db_session.expire_all()
+
+    persisted = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
+    )
+
+    assert persisted is not None
+
+    assert (
+        persisted.status
+        == FEATURE_STATUS_COMPLETED
+    )
+
+    assert (
+        persisted.text_feature
+        is not None
+    )
+
+
+# ============================================================
+# CHILD GENERATION OWNERSHIP
+# ============================================================
+
+
+@patch(
+    "app.tasks.feature_tasks.SessionLocal"
+)
+def test_text_child_rejects_feature_set_from_another_journal(
+    session_local_mock,
+    db_session,
+):
+    session_local_mock.return_value = (
+        db_session
+    )
+
+    first_journal = (
+        make_completed_text_journal(
+            db_session
+        )
+    )
+
+    first_journal_id = (
+        first_journal.id
+    )
+
+    second_user = User(
+        email=(
+            "feature-task-other@example.com"
+        ),
+        password_hash=(
+            "test-password-hash"
+        ),
+    )
+
+    db_session.add(second_user)
+    db_session.flush()
+
+    second_journal = JournalEntry(
+        user_id=second_user.id,
+        entry_type="TEXT",
+        raw_text=(
+            "This belongs to another journal."
+        ),
+        status="COMPLETED",
+    )
+
+    db_session.add(second_journal)
+    db_session.commit()
+
+    second_journal_id = (
+        second_journal.id
+    )
+
+    # Reacquire the first journal because the helper
+    # below expects an ORM object.
+    first_journal = db_session.get(
+        JournalEntry,
+        first_journal_id,
+    )
+
+    assert first_journal is not None
+
+    feature_set = make_feature_set(
+        db_session,
+        journal=first_journal,
+        source_hash=(
+            "ownership-source-hash"
+        ),
+    )
+
+    feature_set_id = feature_set.id
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Feature set does not belong "
+            "to journal"
+        ),
+    ):
+        extract_journal_text_features.run(
+            str(second_journal_id),
+            str(feature_set_id),
+        )
+
+
+# ============================================================
+# AUDIO FAILURE ISOLATION
+# ============================================================
+
+
+@patch(
+    "app.tasks.feature_tasks.SessionLocal"
+)
+@patch(
+    "app.tasks.feature_tasks."
+    "extract_audio_features"
+)
+def test_audio_feature_failure_does_not_fail_journal(
+    extract_mock,
+    session_local_mock,
+    db_session,
+):
+    session_local_mock.return_value = (
+        db_session
+    )
+
+    journal = make_completed_voice_journal(
+        db_session
+    )
+
+    # Capture before task invocation.
+    journal_id = journal.id
+
+    feature_set = make_feature_set(
+        db_session,
+        journal=journal,
+        source_hash=(
+            "audio-failure-source-hash"
+        ),
+    )
+
+    feature_set_id = feature_set.id
+
+    extract_mock.side_effect = RuntimeError(
+        "forced audio encoder failure"
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match=(
+            "forced audio encoder failure"
+        ),
+    ):
+        extract_journal_audio_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+
+    db_session.expire_all()
+
+    persisted_journal = db_session.get(
+        JournalEntry,
+        journal_id,
+    )
+
+    persisted_feature_set = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
+    )
+
+    assert persisted_journal is not None
+    assert persisted_feature_set is not None
+
+    # M3 failure is isolated from the completed
+    # M2 journal lifecycle.
+    assert (
+        persisted_journal.status
+        == "COMPLETED"
+    )
+
+    assert (
+        persisted_feature_set.status
+        == FEATURE_STATUS_FAILED
+    )
+
+    assert (
+        persisted_feature_set.audio_feature
+        is None
+    )
+
+    assert (
+        persisted_feature_set.error_message
+        == (
+            "Audio feature extraction failed: "
+            "RuntimeError"
+        )
+    )
+
+    extract_mock.assert_called_once()
+
+
+# ============================================================
+# PARTIAL VOICE FAILURE / RECOVERY
+# ============================================================
+
+
+@patch(
+    "app.tasks.feature_tasks.SessionLocal"
+)
+@patch(
+    "app.tasks.feature_tasks."
+    "extract_audio_features"
+)
+@patch(
+    "app.services.features.text_features."
+    "get_text_encoder"
+)
+def test_voice_partial_failure_reuses_text_and_recovers_audio(
+    get_text_encoder_mock,
+    extract_audio_mock,
+    session_local_mock,
+    db_session,
+):
+    """
+    Critical M3.7 recovery contract:
+
+        text succeeds
+            +
+        audio fails
+            ↓
+        generation FAILED
+        TextFeature preserved
+            ↓
+        parent-style FAILED -> PENDING reset
+            ↓
+        duplicate text child short-circuits
+            +
+        audio retry succeeds
+            ↓
+        generation COMPLETED
+    """
+
+    session_local_mock.return_value = (
+        db_session
+    )
+
+    journal = make_completed_voice_journal(
+        db_session
+    )
+
+    journal_id = journal.id
+
+    feature_set = make_feature_set(
+        db_session,
+        journal=journal,
+        source_hash=(
+            "voice-partial-recovery-hash"
+        ),
+    )
+
+    feature_set_id = feature_set.id
+
+    encoder = (
+        get_text_encoder_mock.return_value
+    )
+
+    encoder.encode.return_value = (
+        make_text_encoding_result()
+    )
+
+    # --------------------------------------------------------
+    # TEXT SUCCEEDS FIRST
+    # --------------------------------------------------------
+
+    text_result = (
+        extract_journal_text_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+    )
+
+    assert (
+        text_result["status"]
+        == "completed"
+    )
+
+    db_session.expire_all()
+
+    after_text = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
+    )
+
+    assert after_text is not None
+
+    # VOICE requires both modalities.
+    assert (
+        after_text.status
+        != FEATURE_STATUS_COMPLETED
+    )
+
+    assert (
+        after_text.text_feature
+        is not None
+    )
+
+    assert (
+        after_text.audio_feature
+        is None
+    )
+
+    # --------------------------------------------------------
+    # AUDIO FAILS
+    # --------------------------------------------------------
+
+    extract_audio_mock.side_effect = (
+        RuntimeError(
+            "forced audio failure"
+        )
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="forced audio failure",
+    ):
+        extract_journal_audio_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+
+    db_session.expire_all()
+
+    failed = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
+    )
+
+    assert failed is not None
+
+    assert (
+        failed.status
+        == FEATURE_STATUS_FAILED
+    )
+
+    # Successful modality must survive.
+    assert (
+        failed.text_feature
+        is not None
+    )
+
+    assert (
+        failed.audio_feature
+        is None
+    )
+
+    # --------------------------------------------------------
+    # PARENT RECOVERS SAME GENERATION
+    # --------------------------------------------------------
+
+    resolution = resolve_feature_set(
+        db_session,
+        journal_id=journal_id,
+        source_hash=(
+            "voice-partial-recovery-hash"
+        ),
+    )
+
+    assert (
+        resolution.feature_set.id
+        == feature_set_id
+    )
+
+    assert (
+        resolution.feature_set.status
+        == FEATURE_STATUS_PENDING
+    )
+
+    db_session.commit()
+
+    # --------------------------------------------------------
+    # TEXT CHILD IS REDELIVERED
+    # --------------------------------------------------------
+
+    duplicate_text = (
+        extract_journal_text_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+    )
+
+    assert (
+        duplicate_text["status"]
+        == "already_extracted"
+    )
+
+    # Encoder ran only during original delivery.
+    assert (
+        encoder.encode.call_count
+        == 1
+    )
+
+    # --------------------------------------------------------
+    # AUDIO RECOVERS
+    # --------------------------------------------------------
+    #
+    # This test is about orchestration semantics.
+    # Real M3.4/M3.5/M3.6 audio extraction has its own
+    # acceptance coverage.
+    # --------------------------------------------------------
+
+    def successful_audio_extraction(
+        db,
+        *,
+        journal,
+        feature_set,
+    ):
+        from app.models.audio_feature import (
+            AudioFeature,
+        )
+        from app.services.features.feature_sets import (
+            complete_feature_set_if_ready,
+        )
+
+        audio_feature = AudioFeature(
+            preprocessing_version=(
+                "audio-preprocess-v1"
+            ),
+            encoder_name=(
+                "microsoft/wavlm-base-plus"
+            ),
+            encoder_version=(
+                "audio-encoder-v1"
+            ),
+            encoder_revision=(
+                "4c66d4806a428f2e922ccfa1a962776e232d487b"
+            ),
+            embedding_dimension=768,
+            embedding=(
+                [1.0]
+                + [0.0] * 767
+            ),
+            duration_seconds=2.0,
+            speech_ratio=None,
+            sample_rate_hz=16_000,
+            quality_status="GOOD",
+            feature_metadata={},
+        )
+
+        feature_set.audio_feature = (
+            audio_feature
+        )
+
+        db.flush()
+
+        complete_feature_set_if_ready(
+            feature_set,
+            entry_type=journal.entry_type,
+        )
+
+        db.flush()
+
+        class Result:
+            pass
+
+        result = Result()
+        result.feature_set = (
+            feature_set
+        )
+
+        return result
+
+    extract_audio_mock.side_effect = (
+        successful_audio_extraction
+    )
+
+    audio_result = (
+        extract_journal_audio_features.run(
+            str(journal_id),
+            str(feature_set_id),
+        )
+    )
+
+    assert (
+        audio_result["status"]
+        == "completed"
+    )
+
+    db_session.expire_all()
+
+    recovered = db_session.get(
+        JournalFeatureSet,
+        feature_set_id,
+    )
+
+    assert recovered is not None
+
+    assert (
+        recovered.status
+        == FEATURE_STATUS_COMPLETED
+    )
+
+    assert (
+        recovered.text_feature
+        is not None
+    )
+
+    assert (
+        recovered.audio_feature
+        is not None
+    )
+
+    assert (
+        recovered.error_message
+        is None
+    )
+
+    assert (
+        recovered.completed_at
+        is not None
+    )
+
+    persisted_journal = db_session.get(
+        JournalEntry,
+        journal_id,
+    )
+
+    assert persisted_journal is not None
+
+    assert (
+        persisted_journal.status
         == "COMPLETED"
     )

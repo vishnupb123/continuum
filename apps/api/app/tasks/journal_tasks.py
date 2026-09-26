@@ -8,18 +8,22 @@ from app.services.mock_context_model import MockContextModel
 from app.services.storage.factory import get_audio_storage
 from app.services.transcription.factory import get_transcription_provider
 from app.tasks.feature_tasks import (
-    extract_journal_text_features,
+    generate_journal_features,
 )
 from app.tasks.celery_app import celery_app
 
-def _queue_text_feature_extraction(
+def _queue_feature_generation(
     journal_id: str,
 ) -> None:
-    from app.tasks.feature_tasks import (
-        extract_journal_text_features,
-    )
+    """
+    Hand a completed journal to the M3 parent
+    orchestration task.
 
-    extract_journal_text_features.delay(
+    The parent owns feature-generation identity and
+    modality-specific dispatch.
+    """
+
+    generate_journal_features.delay(
         journal_id
     )
 @celery_app.task(
@@ -153,8 +157,8 @@ def process_journal(journal_id: str):
     # recovery path above and retries this dispatch.
     #
     if should_queue_features:
-        _queue_text_feature_extraction(
-            str(journal_uuid)
+        _queue_feature_generation(
+          str(journal_uuid)
         )
 
     return {
