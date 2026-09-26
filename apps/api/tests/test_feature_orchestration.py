@@ -148,7 +148,7 @@ def test_text_parent_resolves_generation_and_dispatches_text(
 )
 @patch(
     "app.tasks.feature_tasks."
-    "_calculate_source_hash"
+    "calculate_journal_source_hash"
 )
 @patch(
     "app.tasks.feature_tasks.SessionLocal"

@@ -1,5 +1,7 @@
 from uuid import UUID
 
+from sqlalchemy.exc import IntegrityError
+
 from app.db.session import SessionLocal
 from app.models.feature_constants import (
     FEATURE_STATUS_COMPLETED,
@@ -16,71 +18,12 @@ from app.services.features.feature_sets import (
     resolve_feature_set,
 )
 from app.services.features.fingerprinting import (
-    fingerprint_text_journal,
-    fingerprint_voice_journal,
+    calculate_journal_source_hash,
 )
 from app.services.features.text_features import (
     extract_text_features,
 )
-from app.services.storage.factory import (
-    get_audio_storage,
-)
 from app.tasks.celery_app import celery_app
-
-
-def _calculate_source_hash(
-    journal: JournalEntry,
-) -> str:
-    """
-    Calculate the feature-generation fingerprint
-    from the exact persisted journal source.
-
-    TEXT:
-        exact persisted raw text
-
-    VOICE:
-        exact persisted transcript + stored audio bytes
-    """
-
-    if journal.entry_type == "TEXT":
-        if journal.raw_text is None:
-            raise ValueError(
-                "TEXT journal has no source text"
-            )
-
-        return fingerprint_text_journal(
-            journal.raw_text
-        ).value
-
-    if journal.entry_type == "VOICE":
-        if (
-            journal.raw_text is None
-            or not journal.raw_text.strip()
-        ):
-            raise ValueError(
-                "VOICE journal has no transcript"
-            )
-
-        if journal.audio is None:
-            raise ValueError(
-                "VOICE journal has no audio"
-            )
-
-        storage = get_audio_storage()
-
-        audio_bytes = storage.get(
-            journal.audio.storage_key
-        )
-
-        return fingerprint_voice_journal(
-            journal.raw_text,
-            audio_bytes,
-        ).value
-
-    raise ValueError(
-        "Unsupported journal entry type: "
-        f"{journal.entry_type}"
-    )
 
 
 # ============================================================
@@ -161,7 +104,7 @@ def generate_journal_features(
             }
 
         source_hash = (
-            _calculate_source_hash(
+            calculate_journal_source_hash(
                 journal
             )
         )
@@ -330,6 +273,126 @@ def _load_child_context(
 
 
 # ============================================================
+# CONCURRENT CHILD CONVERGENCE
+# ============================================================
+
+
+def _text_feature_exists_after_rollback(
+    db,
+    *,
+    journal_uuid: UUID,
+    feature_set_uuid: UUID,
+) -> bool:
+    """
+    Determine whether a concurrent text worker won the
+    persistence race.
+
+    Must only be called after the losing transaction has
+    been rolled back.
+    """
+
+    feature_set = db.get(
+        JournalFeatureSet,
+        feature_set_uuid,
+    )
+
+    if feature_set is None:
+        return False
+
+    if (
+        feature_set.journal_id
+        != journal_uuid
+    ):
+        return False
+
+    return (
+        feature_set.text_feature
+        is not None
+    )
+
+
+def _audio_feature_exists_after_rollback(
+    db,
+    *,
+    journal_uuid: UUID,
+    feature_set_uuid: UUID,
+) -> bool:
+    """
+    Determine whether a concurrent audio worker won the
+    persistence race.
+
+    Must only be called after the losing transaction has
+    been rolled back.
+    """
+
+    feature_set = db.get(
+        JournalFeatureSet,
+        feature_set_uuid,
+    )
+
+    if feature_set is None:
+        return False
+
+    if (
+        feature_set.journal_id
+        != journal_uuid
+    ):
+        return False
+
+    return (
+        feature_set.audio_feature
+        is not None
+    )
+
+
+def _mark_child_failure(
+    db,
+    *,
+    journal_uuid: UUID | None,
+    feature_set_uuid: UUID | None,
+    modality: str,
+    exc: Exception,
+) -> None:
+    """
+    Persist a genuine child extraction failure against the
+    exact generation supplied to the task.
+
+    Concurrent duplicate-persistence races are handled
+    before this helper is called.
+    """
+
+    if (
+        journal_uuid is None
+        or feature_set_uuid is None
+    ):
+        return
+
+    feature_set = db.get(
+        JournalFeatureSet,
+        feature_set_uuid,
+    )
+
+    if feature_set is None:
+        return
+
+    if (
+        feature_set.journal_id
+        != journal_uuid
+    ):
+        return
+
+    mark_feature_set_failed(
+        feature_set,
+        error_message=(
+            f"{modality} feature extraction "
+            f"failed: {type(exc).__name__}"
+        ),
+    )
+
+    db.commit()
+
+
+# ============================================================
 # TEXT CHILD
 # ============================================================
 
@@ -351,6 +414,11 @@ def extract_journal_text_features(
     Extract text features for one exact feature generation.
 
     Duplicate Celery delivery is expected and safe.
+
+    Concurrent duplicate deliveries may both perform
+    extraction, but only one TextFeature may be persisted.
+    A worker losing that persistence race converges on the
+    artifact persisted by the winning worker.
     """
 
     db = SessionLocal()
@@ -438,35 +506,63 @@ def extract_journal_text_features(
             ),
         }
 
-    except Exception as exc:
+    except IntegrityError as exc:
+        # -------------------------------------------------
+        # CONCURRENT DUPLICATE PERSISTENCE
+        # -------------------------------------------------
+        #
+        # Two workers can both pass the initial
+        # text_feature-is-None check.
+        #
+        # PostgreSQL's UNIQUE(feature_set_id) constraint
+        # chooses the persistence winner.
+        #
+        # The losing transaction must rollback before it
+        # can inspect the winner's committed artifact.
+        # -------------------------------------------------
+
         db.rollback()
 
-        # Persist failure only when the exact generation
-        # supplied to this child can be safely reacquired.
         if (
             journal_uuid is not None
             and feature_set_uuid is not None
-        ):
-            feature_set = db.get(
-                JournalFeatureSet,
-                feature_set_uuid,
+            and _text_feature_exists_after_rollback(
+                db,
+                journal_uuid=journal_uuid,
+                feature_set_uuid=feature_set_uuid,
             )
+        ):
+            return {
+                "status": "already_extracted",
+                "feature_set_id": str(
+                    feature_set_uuid
+                ),
+            }
 
-            if (
-                feature_set is not None
-                and feature_set.journal_id
-                == journal_uuid
-            ):
-                mark_feature_set_failed(
-                    feature_set,
-                    error_message=(
-                        "Text feature extraction "
-                        "failed: "
-                        f"{type(exc).__name__}"
-                    ),
-                )
+        # The IntegrityError was not explained by another
+        # worker successfully persisting the same modality.
+        # Treat it as a genuine extraction/persistence
+        # failure.
+        _mark_child_failure(
+            db,
+            journal_uuid=journal_uuid,
+            feature_set_uuid=feature_set_uuid,
+            modality="Text",
+            exc=exc,
+        )
 
-                db.commit()
+        raise
+
+    except Exception as exc:
+        db.rollback()
+
+        _mark_child_failure(
+            db,
+            journal_uuid=journal_uuid,
+            feature_set_uuid=feature_set_uuid,
+            modality="Text",
+            exc=exc,
+        )
 
         raise
 
@@ -497,6 +593,11 @@ def extract_journal_audio_features(
     one exact VOICE feature generation.
 
     Duplicate Celery delivery is expected and safe.
+
+    Concurrent duplicate deliveries may both perform
+    extraction, but only one AudioFeature may be persisted.
+    A worker losing that persistence race converges on the
+    artifact persisted by the winning worker.
     """
 
     db = SessionLocal()
@@ -589,33 +690,46 @@ def extract_journal_audio_features(
             ),
         }
 
-    except Exception as exc:
+    except IntegrityError as exc:
+        # Same convergence contract as the text child.
         db.rollback()
 
         if (
             journal_uuid is not None
             and feature_set_uuid is not None
-        ):
-            feature_set = db.get(
-                JournalFeatureSet,
-                feature_set_uuid,
+            and _audio_feature_exists_after_rollback(
+                db,
+                journal_uuid=journal_uuid,
+                feature_set_uuid=feature_set_uuid,
             )
+        ):
+            return {
+                "status": "already_extracted",
+                "feature_set_id": str(
+                    feature_set_uuid
+                ),
+            }
 
-            if (
-                feature_set is not None
-                and feature_set.journal_id
-                == journal_uuid
-            ):
-                mark_feature_set_failed(
-                    feature_set,
-                    error_message=(
-                        "Audio feature extraction "
-                        "failed: "
-                        f"{type(exc).__name__}"
-                    ),
-                )
+        _mark_child_failure(
+            db,
+            journal_uuid=journal_uuid,
+            feature_set_uuid=feature_set_uuid,
+            modality="Audio",
+            exc=exc,
+        )
 
-                db.commit()
+        raise
+
+    except Exception as exc:
+        db.rollback()
+
+        _mark_child_failure(
+            db,
+            journal_uuid=journal_uuid,
+            feature_set_uuid=feature_set_uuid,
+            modality="Audio",
+            exc=exc,
+        )
 
         raise
 
