@@ -318,7 +318,33 @@ def mark_feature_set_failed(
     feature_set: JournalFeatureSet,
     *,
     error_message: str,
-) -> None:
+) -> bool:
+    """
+    Mark an incomplete feature generation as FAILED.
+
+    COMPLETED is terminal for an immutable generation.
+
+    A stale or duplicate worker may report failure after
+    another worker has already completed the generation.
+    Such a late failure must never downgrade:
+
+        COMPLETED -> FAILED
+
+    Returns:
+        True:
+            The generation was marked FAILED.
+
+        False:
+            The generation was already COMPLETED and was
+            therefore left unchanged.
+    """
+
+    if (
+        feature_set.status
+        == FEATURE_STATUS_COMPLETED
+    ):
+        return False
+
     feature_set.status = (
         FEATURE_STATUS_FAILED
     )
@@ -328,6 +354,8 @@ def mark_feature_set_failed(
     )
 
     feature_set.completed_at = None
+
+    return True
 
 
 def complete_feature_set_if_ready(

@@ -575,10 +575,31 @@ def test_audio_completes_generation_when_text_exists(
     )
 
 
-def test_unusable_audio_is_still_persisted(
+def test_unusable_audio_is_rejected_without_persisting_feature(
     db_session,
     monkeypatch,
 ):
+    """
+    M3.9 quality contract:
+
+    Audio classified as UNUSABLE must not produce or persist an
+    AudioFeature.
+
+    UNUSABLE is a quality-policy failure, not useful feature
+    provenance. Persisting an embedding for effectively silent or
+    otherwise unusable audio could allow downstream consumers to
+    treat meaningless signal as a valid representation.
+
+    The extraction service therefore:
+        - rejects the audio before acoustic/encoder extraction
+        - raises a safe ValueError
+        - does not persist AudioFeature
+        - leaves the generation in PROCESSING
+
+    Generation-level FAILED handling belongs to the task/orchestration
+    boundary and is tested separately in test_feature_tasks.py.
+    """
+
     user = make_user()
 
     db_session.add(user)
@@ -612,47 +633,44 @@ def test_unusable_audio_is_still_persisted(
         pipeline_result=expected,
     )
 
-    result = extract_audio_features(
-        db_session,
-        journal=journal,
-        feature_set=feature_set,
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Journal audio is unusable "
+            "after quality assessment"
+        ),
+    ):
+        extract_audio_features(
+            db_session,
+            journal=journal,
+            feature_set=feature_set,
+        )
+
+    db_session.flush()
+    db_session.expire_all()
+
+    persisted_feature_set = db_session.get(
+        JournalFeatureSet,
+        feature_set.id,
     )
 
+    assert persisted_feature_set is not None
+
+    # M3.9 invariant:
+    # UNUSABLE audio must never create a misleading
+    # representation.
     assert (
-        result.audio_feature.quality_status
-        == FEATURE_QUALITY_UNUSABLE
+        persisted_feature_set.audio_feature
+        is None
     )
 
+    # This service owns feature extraction, not generation-level
+    # failure handling. The Celery task catches the exception and
+    # transitions the generation to FAILED.
     assert (
-        result.audio_feature.feature_metadata[
-            "quality_reasons"
-        ]
-        == [
-            "effectively_silent",
-            "almost_entirely_silent",
-        ]
-    )
-
-    # An unusable signal is still valuable
-    # provenance. We persist it rather than
-    # pretending extraction never occurred.
-    assert (
-        feature_set.audio_feature
-        is not None
-    )
-
-    assert (
-        feature_set.status
+        persisted_feature_set.status
         == FEATURE_STATUS_PROCESSING
     )
-
-    # M3.6 currently preserves the representation
-    # even when engineering quality is UNUSABLE.
-    # Downstream consumers must inspect quality_status.
-    assert_valid_mock_audio_embedding(
-        result.audio_feature
-    )
-
 
 def test_text_journal_rejects_audio_extraction(
     db_session,

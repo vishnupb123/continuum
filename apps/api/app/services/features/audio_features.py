@@ -27,6 +27,10 @@ from app.services.storage.factory import (
     get_audio_storage,
 )
 
+from app.models.feature_constants import (
+    FEATURE_QUALITY_UNUSABLE,
+)
+
 
 @dataclass(frozen=True)
 class AudioFeatureExtractionResult:
@@ -110,6 +114,30 @@ def extract_audio_features(
     pipeline_result = process_audio(
         audio_bytes
     )
+    
+        # ---------------------------------------------------------
+    # Quality gate
+    # ---------------------------------------------------------
+    #
+    # Structurally decodable audio may still be unusable for
+    # feature generation.
+    #
+    # UNUSABLE input must never reach deterministic acoustic
+    # extraction or the learned audio encoder. Persisting an
+    # embedding for effectively meaningless signal would make
+    # downstream ContextOS representations misleading.
+    #
+    # DEGRADED audio remains usable and continues normally.
+    # ---------------------------------------------------------
+
+    if (
+        pipeline_result.quality_status
+        == FEATURE_QUALITY_UNUSABLE
+    ):
+        raise ValueError(
+            "Journal audio is unusable "
+            "after quality assessment"
+        )
 
     # ---------------------------------------------------------
     # M3.5
