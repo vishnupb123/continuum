@@ -19,6 +19,13 @@ from app.services.features.text_features import (
     extract_text_features,
 )
 
+from app.services.features.feature_sets import (
+    get_current_completed_feature_set,
+)
+from app.services.features.fingerprinting import (
+    calculate_journal_source_hash,
+)
+
 
 def make_journal(
     db_session,
@@ -205,6 +212,205 @@ def test_text_journal_is_preprocessed_encoded_and_persisted(
 
     assert result.feature_set.id == stored.id
 
+
+@patch(
+    "app.services.features.text_features."
+    "get_text_encoder"
+)
+def test_text_generation_is_available_to_m4_handoff(
+    get_text_encoder_mock,
+    db_session,
+):
+    """
+    M3.10 TEXT acceptance:
+
+    A completed TEXT journal is converted into a canonical
+    M3 generation, persisted, completed, and then retrieved
+    through the authoritative M3 -> M4 handoff.
+    """
+
+    journal = make_journal(
+        db_session,
+        text=(
+            "Today was productive and focused. "
+            "I completed the work I had planned "
+            "and felt positive about my progress."
+        ),
+    )
+
+    # ---------------------------------------------------------
+    # Canonical generation identity
+    # ---------------------------------------------------------
+
+    source_hash = (
+        calculate_journal_source_hash(
+            journal
+        )
+    )
+
+    feature_set = JournalFeatureSet(
+        journal_id=journal.id,
+        pipeline_version="m3-v1",
+        source_hash=source_hash,
+        status=FEATURE_STATUS_PENDING,
+    )
+
+    db_session.add(feature_set)
+    db_session.flush()
+
+    feature_set_id = feature_set.id
+
+    # ---------------------------------------------------------
+    # Deterministic encoder boundary
+    # ---------------------------------------------------------
+
+    encoder = (
+        get_text_encoder_mock.return_value
+    )
+
+    encoder.encode.return_value = (
+        make_encoding_result()
+    )
+
+    # ---------------------------------------------------------
+    # Real text feature pipeline
+    # ---------------------------------------------------------
+
+    result = extract_text_features(
+        db_session,
+        journal=journal,
+        feature_set=feature_set,
+    )
+
+    assert (
+        result.feature_set.id
+        == feature_set_id
+    )
+
+    assert (
+        feature_set.status
+        == FEATURE_STATUS_COMPLETED
+    )
+
+    assert (
+        feature_set.text_feature
+        is not None
+    )
+
+    assert (
+        feature_set.text_feature.embedding
+        is not None
+    )
+
+    assert (
+        feature_set.text_feature.embedding_dimension
+        == 768
+    )
+
+    # M3 must not mutate the completed M2 lifecycle.
+    assert (
+        journal.status
+        == "COMPLETED"
+    )
+
+    # ---------------------------------------------------------
+    # Persist the completed generation
+    # ---------------------------------------------------------
+
+    db_session.commit()
+    db_session.expire_all()
+
+    # ---------------------------------------------------------
+    # Authoritative M3 -> M4 handoff
+    # ---------------------------------------------------------
+
+    current_feature_set = (
+        get_current_completed_feature_set(
+            db_session,
+            journal=journal,
+        )
+    )
+
+    assert (
+        current_feature_set
+        is not None
+    )
+
+    assert (
+        current_feature_set.id
+        == feature_set_id
+    )
+
+    assert (
+        current_feature_set.status
+        == FEATURE_STATUS_COMPLETED
+    )
+
+    assert (
+        current_feature_set.source_hash
+        == source_hash
+    )
+
+    assert (
+        current_feature_set.pipeline_version
+        == "m3-v1"
+    )
+
+    # ---------------------------------------------------------
+    # M4-consumable text representation
+    # ---------------------------------------------------------
+
+    text_feature = (
+        current_feature_set.text_feature
+    )
+
+    assert text_feature is not None
+
+    assert (
+        text_feature.source_type
+        == "RAW_TEXT"
+    )
+
+    assert (
+        text_feature.embedding
+        is not None
+    )
+
+    assert (
+        text_feature.embedding_dimension
+        == 768
+    )
+
+    assert (
+        text_feature.preprocessing_version
+        == "text-preprocess-v1"
+    )
+
+    assert (
+        text_feature.encoder_version
+        == "text-encoder-v1"
+    )
+
+    assert (
+        text_feature.feature_metadata[
+            "fingerprint_version"
+        ]
+        == "source-fingerprint-v1"
+    )
+
+    assert (
+        text_feature.feature_metadata[
+            "embedding_normalized"
+        ]
+        is True
+    )
+
+    assert (
+        text_feature.feature_metadata[
+            "similarity_metric"
+        ]
+        == "cosine"
+    )
 
 @patch(
     "app.services.features.text_features."
