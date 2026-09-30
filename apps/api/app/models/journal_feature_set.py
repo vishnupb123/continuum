@@ -99,3 +99,9 @@ class JournalFeatureSet(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+
+    context_inferences = relationship(
+        "ContextInference",
+        back_populates="feature_set",
+        cascade="all, delete-orphan",
+    )
