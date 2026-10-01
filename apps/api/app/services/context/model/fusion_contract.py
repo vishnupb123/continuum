@@ -1,9 +1,6 @@
 import torch
 
-from app.models.feature_constants import (
-    FEATURE_QUALITY_DEGRADED,
-    FEATURE_QUALITY_GOOD,
-)
+
 from app.services.context.model.projections import (
     CONTEXT_PROJECTION_DIMENSION,
 )
@@ -21,10 +18,10 @@ FUSION_GATE_INPUT_DIMENSION = (
 )
 
 
-QUALITY_FEATURE_VALUES = {
-    FEATURE_QUALITY_GOOD: 1.0,
-    FEATURE_QUALITY_DEGRADED: 0.5,
-}
+from app.services.context.model.quality_evidence import (
+    QualityEvidenceError,
+    encode_quality_evidence,
+)
 
 
 class FusionContractError(ValueError):
@@ -43,10 +40,10 @@ def encode_quality(
     """
 
     try:
-        return QUALITY_FEATURE_VALUES[
+        return encode_quality_evidence(
             quality
-        ]
-    except KeyError as exc:
+        )
+    except QualityEvidenceError as exc:
         raise FusionContractError(
             "Fusion quality must be GOOD or DEGRADED"
         ) from exc
