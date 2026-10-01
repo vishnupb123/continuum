@@ -118,6 +118,11 @@ class ContextInference(Base):
         nullable=False,
     )
 
+    state_capability: Mapped[str] = mapped_column(
+    String(40),
+    nullable=False,
+    )
+
     status: Mapped[str] = mapped_column(
         String(40),
         nullable=False,
@@ -179,6 +184,8 @@ class ContextInference(Base):
             default=False,
         )
     )
+
+
 
     inference_metadata: Mapped[dict] = mapped_column(
         JSON,

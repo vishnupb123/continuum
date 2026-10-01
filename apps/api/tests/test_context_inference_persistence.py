@@ -78,6 +78,7 @@ def make_completed_inference(
         architecture_version=ARCHITECTURE_VERSION,
         model_revision=model_revision,
         model_artifact_hash=MODEL_ARTIFACT_HASH,
+        state_capability="VALIDATED",
         status="COMPLETED",
         representation_dimension=256,
         representation=make_representation(),
@@ -246,13 +247,14 @@ def test_pending_inference_allows_null_outputs(
     )
 
     inference = ContextInference(
-        feature_set_id=feature_set.id,
-        architecture_version=ARCHITECTURE_VERSION,
-        model_revision=MODEL_REVISION,
-        model_artifact_hash=MODEL_ARTIFACT_HASH,
-        status="PENDING",
-        confidence_calibrated=False,
-        inference_metadata={},
+    feature_set_id=feature_set.id,
+    architecture_version=ARCHITECTURE_VERSION,
+    model_revision=MODEL_REVISION,
+    model_artifact_hash=MODEL_ARTIFACT_HASH,
+    state_capability="VALIDATED",
+    status="PENDING",
+    confidence_calibrated=False,
+    inference_metadata={},
     )
 
     db_session.add(inference)
@@ -284,26 +286,28 @@ def test_same_inference_generation_cannot_be_duplicated(
     )
 
     first = ContextInference(
-        feature_set_id=feature_set.id,
-        architecture_version=ARCHITECTURE_VERSION,
-        model_revision=MODEL_REVISION,
-        model_artifact_hash=MODEL_ARTIFACT_HASH,
-        status="PENDING",
-        confidence_calibrated=False,
-        inference_metadata={},
+    feature_set_id=feature_set.id,
+    architecture_version=ARCHITECTURE_VERSION,
+    model_revision=MODEL_REVISION,
+    model_artifact_hash=MODEL_ARTIFACT_HASH,
+    state_capability="VALIDATED",
+    status="PENDING",
+    confidence_calibrated=False,
+    inference_metadata={},
     )
 
     db_session.add(first)
     db_session.commit()
 
     duplicate = ContextInference(
-        feature_set_id=feature_set.id,
-        architecture_version=ARCHITECTURE_VERSION,
-        model_revision=MODEL_REVISION,
-        model_artifact_hash=MODEL_ARTIFACT_HASH,
-        status="PENDING",
-        confidence_calibrated=False,
-        inference_metadata={},
+    feature_set_id=feature_set.id,
+    architecture_version=ARCHITECTURE_VERSION,
+    model_revision=MODEL_REVISION,
+    model_artifact_hash=MODEL_ARTIFACT_HASH,
+    state_capability="VALIDATED",
+    status="PENDING",
+    confidence_calibrated=False,
+    inference_metadata={},
     )
 
     db_session.add(duplicate)
@@ -323,27 +327,29 @@ def test_same_feature_set_allows_new_model_revision(
     )
 
     r1 = ContextInference(
-        feature_set_id=feature_set.id,
-        architecture_version=ARCHITECTURE_VERSION,
-        model_revision="test-r1",
-        model_artifact_hash=hashlib.sha256(
-            b"artifact-r1"
-        ).hexdigest(),
-        status="PENDING",
-        confidence_calibrated=False,
-        inference_metadata={},
-    )
+    feature_set_id=feature_set.id,
+    architecture_version=ARCHITECTURE_VERSION,
+    model_revision="test-r1",
+    model_artifact_hash=hashlib.sha256(
+        b"artifact-r1"
+    ).hexdigest(),
+    state_capability="VALIDATED",
+    status="PENDING",
+    confidence_calibrated=False,
+    inference_metadata={},
+   )
 
     r2 = ContextInference(
-        feature_set_id=feature_set.id,
-        architecture_version=ARCHITECTURE_VERSION,
-        model_revision="test-r2",
-        model_artifact_hash=hashlib.sha256(
-            b"artifact-r2"
-        ).hexdigest(),
-        status="PENDING",
-        confidence_calibrated=False,
-        inference_metadata={},
+    feature_set_id=feature_set.id,
+    architecture_version=ARCHITECTURE_VERSION,
+    model_revision="test-r2",
+    model_artifact_hash=hashlib.sha256(
+        b"artifact-r2"
+    ).hexdigest(),
+    state_capability="VALIDATED",
+    status="PENDING",
+    confidence_calibrated=False,
+    inference_metadata={},
     )
 
     db_session.add_all([r1, r2])
