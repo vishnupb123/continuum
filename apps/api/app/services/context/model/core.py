@@ -8,6 +8,9 @@ from app.services.context.model.projections import (
     CONTEXT_PROJECTION_DIMENSION,
     ContextModalityProjections,
 )
+from app.services.context.model.fusion import (
+    GatedMultimodalFusion,
+)
 
 
 class ContextObservationCore(nn.Module):
@@ -35,6 +38,7 @@ class ContextObservationCore(nn.Module):
         super().__init__()
 
         self.projections = ContextModalityProjections()
+        self.fusion = GatedMultimodalFusion()
 
         self.observation = ObservationBlock(
             dimension=CONTEXT_PROJECTION_DIMENSION,
@@ -95,4 +99,55 @@ class ContextObservationCore(nn.Module):
 
         return self.encode_shared_representation(
             projected
+        )
+
+    def encode_voice(
+    self,
+    text_embedding: torch.Tensor,
+    audio_embedding: torch.Tensor,
+    *,
+    text_quality: str,
+    audio_quality: str,
+    ) -> torch.Tensor:
+        """
+        Complete VOICE current-observation path:
+
+            Et[768] -> text projection  -> T[256]
+                                          |
+                                          | gated multimodal fusion
+                                          |
+            Ea[768] -> audio projection -> A[256]
+                                          |
+                                          v
+                                        F[256]
+                                          |
+                                  observation block
+                                          |
+                                          v
+                                       Rc[256]
+
+        Quality labels influence the learned fusion gate.
+        They do not directly modify the M3 embeddings.
+
+        This represents one current observation only.
+        No longitudinal memory or trend reasoning occurs here.
+        """
+
+        projected_text = self.project_text(
+            text_embedding
+        )
+
+        projected_audio = self.project_audio(
+            audio_embedding
+        )
+
+        fused = self.fusion(
+            projected_text,
+            projected_audio,
+            text_quality=text_quality,
+            audio_quality=audio_quality,
+        )
+
+        return self.encode_shared_representation(
+            fused
         )
